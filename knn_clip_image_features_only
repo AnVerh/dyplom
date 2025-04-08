@@ -1,0 +1,51 @@
+from PIL import Image
+from sklearn.neighbors import KNeighborsClassifier
+from transformers import CLIPProcessor, CLIPModel
+import torch
+import os
+import numpy as np
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
+support_dir = "/home/kpi_anna/data/test_grasp_dataset/set_1"
+query_image_path = "/home/kpi_anna/data/test_grasp_dataset/query_set/image.png"
+
+support_features = []
+support_labels = []
+
+for class_name in os.listdir(support_dir):
+    class_folder = os.path.join(support_dir, class_name)
+    if not os.path.isdir(class_folder):
+        continue
+    for img_name in os.listdir(class_folder):
+        image_path = os.path.join(class_folder, img_name)
+        image = Image.open(image_path).convert("RGB")
+        inputs = processor(images=image, return_tensors="pt").to(device)
+        with torch.no_grad():
+            features = model.get_image_features(**inputs)
+            features /= features.norm(p=2, dim=-1, keepdim=True)
+        support_features.append(features.squeeze().cpu().numpy())
+        support_labels.append(class_name)
+
+support_features = np.array(support_features)
+
+# Encode query
+query_image = Image.open(query_image_path).convert("RGB")
+inputs = processor(images=query_image, return_tensors="pt").to(device)
+with torch.no_grad():
+    query_feature = model.get_image_features(**inputs)
+    query_feature /= query_feature.norm(p=2, dim=-1, keepdim=True)
+
+query_vector = query_feature.squeeze().cpu().numpy()
+
+# Run KNN
+knn = KNeighborsClassifier(n_neighbors=3, metric="cosine")
+knn.fit(support_features, support_labels)
+prediction = knn.predict([query_vector])[0]
+neighbors = knn.kneighbors([query_vector], return_distance=False)[0]
+neighbor_classes = [support_labels[i] for i in neighbors]
+
+print("Predicted class:", prediction)
+print("3 nearest neighbors:", neighbor_classes)
