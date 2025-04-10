@@ -3,6 +3,7 @@ from transformers import CLIPProcessor, CLIPModel
 from PIL import Image
 import os
 import numpy as np
+from sklearn.neighbors import NearestNeighbors
 
 # Initialize CLIP model and processor
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -34,22 +35,26 @@ support_features = {grasp: np.array(features) for grasp, features in support_fea
 
 # Define multiple prompts for each grasp type
 prompts = {
-    "cylindrical": ["An object that requires a cylindrical grasp, like a bottle or a handle.",
-                    "An object that is held cylindrically with all fingers wrapped around it."],
-    "hook": ["An object that requires a hook grasp, like a bag or a bucket.",
+    "cylindrical_grasp": ["An object that requires a cylindrical grasp, like a bottle or a handle.",
+                    "An object that is held cylindrically with all fingers wrapped around it.",
+                    "An object that is heavy and requires power to lift it"],
+    "hook_grasp": ["An object that requires a hook grasp, like a bag or a bucket.",
              "An object held with a hook-like shape using 4 fingers, without the thumb."],
-    "palmar": ["An object that requires a palmar grasp, can fit in a hand, like a notebook or smartphone.",
+    "palmar_grasp": ["An object that requires a palmar grasp, can fit in a hand, like a notebook or smartphone.",
                "An object that is held in the palm of the hand."],
-    "spherical": ["An object that requires a spherical grasp, like an apple or a small ball.",
+    "spherical_grasp": ["An object that requires a spherical grasp, like an apple or a small ball.",
                   "An object that is grasped with fingers and palm forming a sphere."],
-    "tripod": ["An object that requires a tripod grasp, like a pen or a pencil.",
+    "tripod_grasp": ["An object that requires a tripod grasp, like a pen or a pencil.",
                "An object held between three fingers."],
-    "pinch": ["An object that requires a pinch grasp, like a coin or needle.",
-              "An object held with the thumb and one finger."],
-    "open": ["An object that requires an open grasp, like a flat box.",
+    "pinch_grasp": ["An object that requires a pinch grasp, like a coin or needle.",
+              "An object held with the thumb and one other finger.", 
+              "An object that is tiny, light, and delicate"],
+    "open_grasp": ["An object that requires an open grasp, like a flat box.",
              "An object that is grasped with an open hand."],
-    "adaptive": ["An object that requires an adaptive grasp, has an uneven form.",
-                 "An object that needs an adaptable grip based on its shape."]
+    #"adaptive_grasp": ["An object that requires an adaptive grasp, has an uneven form.",
+    #             "An object that needs an adaptable grip based on its shape."],
+    "lateral_grasp": ["An object that irequires a lateral grasp, like a key or a credit card.",
+                      "An object that is held between the thumb and the side of the index finger"]
 }
 
 # Function to encode multiple prompts and average text embeddings
@@ -66,9 +71,8 @@ def encode_text_prompts(prompts, clip_model, device):
 
 # Get text features for each grasp class
 text_features = encode_text_prompts(prompts, clip_model, device)
-from sklearn.neighbors import NearestNeighbors
 
-def predict_image_grasp_type(image_path):
+def predict_image_grasp_type_with_knn(image_path):
     query_image = Image.open(image_path)
     query_image_input = clip_processor(images=query_image, return_tensors='pt').to(device)
 
@@ -86,7 +90,7 @@ def predict_image_grasp_type(image_path):
     knn.fit(support_vectors)
 
     # Find the nearest neighbor to the query image
-    distances, indices = knn.kneighbors(query_image_feature.cpu().numpy().reshape(1, -1))
+    _, indices = knn.kneighbors(query_image_feature.cpu().numpy().reshape(1, -1))
 
     # Get predicted label from the nearest neighbor
     predicted_label = support_labels[indices[0][0]]
@@ -103,7 +107,6 @@ set_directory = '/home/kpi_anna/data/test_grasp_dataset/set_1'
 
 # Load ground truth labels (example as a dictionary)
 ground_truth = {
-    "image.png": "cylindrical grasp",
     "image1.png": "cylindrical grasp",
     "image2.png": "hook grasp",
     "image3.png": "hook grasp",
@@ -115,7 +118,10 @@ ground_truth = {
     "image9.png": "tripod grasp",
     "image10.png": "cylindrical grasp",
     "image11.png": "open grasp",
-    "image12.png": "adaptive grasp",
+    #"image12.png": "adaptive grasp",
+    "image13.png": "lateral grasp",
+    "image14.png": "lateral grasp",
+    "image15.png": "cylindrical grasp",
 }
 
 # Initialize counters
@@ -125,10 +131,43 @@ num_images = len(ground_truth)
 # Iterate through all images in the query set
 for image_name, true_label in ground_truth.items():
     image_path = os.path.join(query_set_directory, image_name)
-    predicted_label = predict_image_grasp_type(image_path)
+    '''
+    predicted_label = predict_image_grasp_type_with_knn(image_path)
      # Compare prediction with ground truth
     if true_label in predicted_label:
         num_correct_predictions += 1
+    '''
+    query_image = Image.open(image_path)
+    query_image_input = clip_processor(images=query_image, return_tensors='pt').to(device)
+    # Extract image feature for query image
+    with torch.no_grad():
+        query_image_feature = clip_model.get_image_features(**query_image_input)
+        query_vector = query_image_feature[0].cpu().numpy()
+    # Normalize
+    query_vector = query_vector / np.linalg.norm(query_vector)
+
+    # Image support features (N classes × 512)
+    image_similarities = {
+        label: np.dot(query_vector, vec.squeeze(0) / np.linalg.norm(vec))
+        for label, vec in support_features.items()}
+
+    # Text features (same grasp_types, different source)
+    text_similarities = {
+        label: np.dot(query_vector, vec / np.linalg.norm(vec))
+        for label, vec in text_features.items()}
+    
+    combined_scores = {
+    label: 0.25 * image_similarities[label] + 0.75 * text_similarities[label]
+    for label in grasp_types}
+
+    predicted_label = max(combined_scores, key=combined_scores.get)
+    predicted_label = str(predicted_label).replace('_', ' ')
+    if true_label in predicted_label:
+        num_correct_predictions += 1
+        print(f"Predicted grasp for {image_name}:", predicted_label)
+    else: 
+        print(f"Predicted grasp {image_name}:", predicted_label, " - INCORRECT!")
+
 
 # Calculate accuracy
 accuracy = (num_correct_predictions / num_images) * 100
