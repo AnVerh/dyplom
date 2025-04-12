@@ -4,6 +4,9 @@ from PIL import Image
 import os
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
+from sklearn.metrics.pairwise import cosine_similarity
+from collections import defaultdict
+
 
 # Initialize CLIP model and processor
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -79,6 +82,9 @@ def predict_image_grasp_type_with_knn(image_path):
     # Extract image feature for query image
     with torch.no_grad():
         query_image_feature = clip_model.get_image_features(**query_image_input)
+        query_vector = query_image_feature[0].cpu().numpy()
+    # Normalize
+    query_vector = query_vector / np.linalg.norm(query_vector)
 
     # Reshape support features to fit into KNN
     support_labels = list(support_features.keys())
@@ -91,9 +97,17 @@ def predict_image_grasp_type_with_knn(image_path):
 
     # Find the nearest neighbor to the query image
     _, indices = knn.kneighbors(query_image_feature.cpu().numpy().reshape(1, -1))
+    label_scores = defaultdict(float)
+    for idx in indices[0]:
+        label = support_labels[idx]
+        img_sim = cosine_similarity([query_vector], [support_vectors[idx]])[0][0]
+        txt_sim = cosine_similarity([query_vector], [text_features[label]])[0][0]
+        combined = 0.25 * img_sim + 0.75 * txt_sim
+        label_scores[label] += combined
 
-    # Get predicted label from the nearest neighbor
-    predicted_label = support_labels[indices[0][0]]
+    print(f"label scores: \n {label_scores}")
+    # Predict class with highest accumulated score
+    predicted_label = max(label_scores, key=label_scores.get)
     print(f"Predicted grasp type for {os.path.basename(image_path)}: {predicted_label}")
     predicted_label = str(predicted_label).replace('_', ' ')
     return predicted_label
@@ -131,37 +145,9 @@ num_images = len(ground_truth)
 # Iterate through all images in the query set
 for image_name, true_label in ground_truth.items():
     image_path = os.path.join(query_set_directory, image_name)
-    '''
-    predicted_label = predict_image_grasp_type_with_knn(image_path)
-     # Compare prediction with ground truth
-    if true_label in predicted_label:
-        num_correct_predictions += 1
-    '''
-    query_image = Image.open(image_path)
-    query_image_input = clip_processor(images=query_image, return_tensors='pt').to(device)
-    # Extract image feature for query image
-    with torch.no_grad():
-        query_image_feature = clip_model.get_image_features(**query_image_input)
-        query_vector = query_image_feature[0].cpu().numpy()
-    # Normalize
-    query_vector = query_vector / np.linalg.norm(query_vector)
-
-    # Image support features (N classes × 512)
-    image_similarities = {
-        label: np.dot(query_vector, vec.squeeze(0) / np.linalg.norm(vec))
-        for label, vec in support_features.items()}
-
-    # Text features (same grasp_types, different source)
-    text_similarities = {
-        label: np.dot(query_vector, vec / np.linalg.norm(vec))
-        for label, vec in text_features.items()}
     
-    combined_scores = {
-    label: 0.25 * image_similarities[label] + 0.75 * text_similarities[label]
-    for label in grasp_types}
+    predicted_label = predict_image_grasp_type_with_knn(image_path)
 
-    predicted_label = max(combined_scores, key=combined_scores.get)
-    predicted_label = str(predicted_label).replace('_', ' ')
     if true_label in predicted_label:
         num_correct_predictions += 1
         print(f"Predicted grasp for {image_name}:", predicted_label)
@@ -172,4 +158,3 @@ for image_name, true_label in ground_truth.items():
 # Calculate accuracy
 accuracy = (num_correct_predictions / num_images) * 100
 print(f"Accuracy: {accuracy:.2f}%")
-# print(f"Predicted Grasp: {predicted_label}")
