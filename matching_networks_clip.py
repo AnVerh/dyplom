@@ -2,116 +2,123 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import CLIPModel, CLIPProcessor
-from torch.utils.data import DataLoader
-from PIL import Image
-import torchvision.transforms as transforms
 from torchvision.datasets import ImageFolder
+import torchvision.transforms as transforms
+from PIL import Image
+import os, json
 
 # Load CLIP model and processor
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
 processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
+# Image encoding
 def encode_images(images):
-    # preprocessed_images = [transform(img) for img in images] 
     inputs = processor(images=images, return_tensors="pt", padding=True, do_rescale=False).to(device)
     with torch.no_grad():
         embeddings = model.get_image_features(**inputs)
-    return embeddings / embeddings.norm(dim=-1, keepdim=True)  # Normalize embeddings
+    return embeddings / embeddings.norm(dim=-1, keepdim=True)
 
+# Matching Network
 class MatchingNetwork(nn.Module):
-    def __init__(self):
+    def __init__(self, num_classes):
         super(MatchingNetwork, self).__init__()
-        
-    def forward(self, support_embeddings, support_labels, query_embedding):
-        """
-        support_embeddings: Tensor of shape (num_support, embedding_dim)
-        support_labels: Tensor of shape (num_support, num_classes)
-        query_embedding: Tensor of shape (embedding_dim)
-        """
-        # Compute cosine similarities between query and support embeddings
-        similarities = F.cosine_similarity(query_embedding.unsqueeze(0), support_embeddings, dim=-1)
-        
-        # Compute attention weights
-        attention_weights = F.softmax(similarities, dim=0)  # Shape: (num_support,)
+        self.num_classes = num_classes
 
-        support_labels = support_labels.to(torch.int64)
-        num_classes = 4  # Replace with the actual number of classes
-        support_labels_one_hot = torch.zeros(len(support_labels), num_classes).to(device)
+    def forward(self, support_embeddings, support_labels, query_embedding):
+        similarities = F.cosine_similarity(query_embedding, support_embeddings)
+        attention_weights = F.softmax(similarities, dim=0)
+
+        support_labels_one_hot = torch.zeros(len(support_labels), self.num_classes).to(device)
         support_labels_one_hot.scatter_(1, support_labels.unsqueeze(1), 1)
 
-        # Predict class probabilities as weighted sum of support labels
-        predictions = torch.matmul(attention_weights, support_labels_one_hot)  # Shape: (num_classes,)
-        
+        predictions = torch.matmul(attention_weights, support_labels_one_hot)
         return predictions
 
-# Example support data (images and labels)
-support_images = [...]  # List of PIL images
-support_labels = torch.tensor([
-    [1, 0, 0],  # Class 0
-    [0, 1, 0],  # Class 1
-    [0, 0, 1]   # Class 2
-])  # One-hot encoded labels
-
+# Data preprocessing
 transform = transforms.Compose([
-    transforms.Resize((224, 224)),  # Ensure compatibility with CLIP
+    transforms.Resize((224, 224)),
     transforms.ToTensor()
 ])
 
 dataset_path = "/home/kpi_anna/data/test_grasp_dataset/set_1"
+query_set_directory = '/home/kpi_anna/data/test_grasp_dataset/query_set'
+query_json_path = "grasp_scripts/query_labels.json"
+
 dataset = ImageFolder(root=dataset_path, transform=transform)
-
-# Print class mapping
 class_to_idx = dataset.class_to_idx
-print("Class to Index Mapping:", class_to_idx)
+num_classes = len(class_to_idx)
 
-# Split dataset into support & query sets
-def split_dataset(dataset, num_shots=4):
-    support_set, query_set = [], []
+def split_dataset(dataset):
+    support_set = []
     class_dict = {}
-
     for img, label in dataset:
-        if label not in class_dict:
-            class_dict[label] = []
-        class_dict[label].append(img)
-
+        class_dict.setdefault(label, []).append(img)
     for label, images in class_dict.items():
-        support_set.extend([(img, label) for img in images[:num_shots]])
-        query_set.extend([(img, label) for img in images[num_shots:]])
-    
-    return support_set, query_set
+        support_set.extend([(img, label) for img in images])
+    return support_set
 
-support_set, query_set = split_dataset(dataset)
+def load_query_set_from_json(query_json_path, transform, class_to_idx):
+    with open(query_json_path, 'r') as f:
+        query_labels = json.load(f)
+    query_set = []
+    for filename, labels in query_labels.items():
+        image_path = os.path.join(query_set_directory, filename)
+        if not os.path.exists(image_path):
+            print(f"⚠️ Image {filename} not found, skipping.")
+            continue
+        image = Image.open(image_path).convert("RGB")
+        image_tensor = transform(image)
+        main_label = labels[0].replace(" ", "_")
+        if main_label not in class_to_idx:
+            print(f"⚠️ Label {main_label} not in support set mapping.")
+            continue
+        label_idx = class_to_idx[main_label]
+        query_set.append((filename, image_tensor, label_idx))
+    return query_set
 
-support_images = torch.stack([img for img, _ in support_set]).to(device)  # Tensor of shape (num_support, channels, height, width)
-support_labels = torch.tensor([label for _, label in support_set]).to(device)  # Tensor of shape (num_support,)
+# Load support and query sets
+support_set = split_dataset(dataset)
+query_set = load_query_set_from_json(query_json_path, transform, class_to_idx)
 
-# Example query image
-query_image = query_set[0][0].to(device)  # Single PIL image
+# Prepare support embeddings
+support_images = torch.stack([img for img, _ in support_set]).to(device)
+support_labels = torch.tensor([label for _, label in support_set]).to(device)
+print("Support set labels:", support_labels)
+print("Unique labels in support:", torch.unique(torch.tensor(support_labels)))
 support_embeddings = encode_images(support_images)
-query_embedding = encode_images([query_image])#.squeeze(0)  # Remove batch dimension
-# Remove any detach() or no_grad() contexts where support_embeddings are created
-support_embeddings.requires_grad = True  # Ensure gradients are tracked
-query_embedding.requires_grad = True
 
-# Example Matching Network usage
-matching_network = MatchingNetwork().to(device)
+# Initialize model
+matching_network = MatchingNetwork(num_classes=num_classes).to(device)
 
-# Forward pass
-predictions = matching_network(support_embeddings, support_labels.float(), query_embedding).to(device)
+# Accuracy counter
+correct = 0
+total = len(query_set)
+losses = []
 
-# Compute loss
-query_label = torch.tensor([0, 1, 0, 0]).to(device)  # Ground truth one-hot label for query
-# Convert one-hot encoded query label to a class index
-query_label_index = torch.argmax(query_label).to(device)
-# Debug information
-print(f"Query label index: {query_label_index.item()}, Predictions shape: {predictions.shape}")
+# Evaluation loop
+for filename, query_image, true_label in query_set:
+    query_image = query_image.unsqueeze(0).to(device)
+    query_embedding = encode_images([query_image.squeeze(0)])
+    predictions = matching_network(support_embeddings, support_labels, query_embedding)
+    print(f"Prediction for {filename}:")
+    print(predictions)
+    predicted_class = torch.argmax(predictions).item()
+    if predicted_class == true_label:
+        correct += 1
+        print(f"Prediction for {filename} - {predicted_class} - correct")
+    else:
+        print(f"Prediction for {filename} - {predicted_class} - INCORRECT - when correct is {true_label}")
 
-# Check range
-assert 0 <= query_label_index.item() < predictions.size(1), "query_label_index is out of range!"
+    # Cross-entropy loss
+    target = torch.tensor([true_label], dtype=torch.long).to(device)
+    loss = F.cross_entropy(predictions.unsqueeze(0), target)
+    losses.append(loss.item())
 
-print(f"query label index should be between 0 and 3, got: {query_label_index}")
-# Compute cross-entropy loss
-loss = F.cross_entropy(predictions.unsqueeze(0), query_label_index)
-# loss = F.cross_entropy(predictions.unsqueeze(0), query_label.unsqueeze(0).float())
-loss.backward()
+# Final results
+accuracy = correct / total * 100
+avg_loss = sum(losses) / len(losses)
+
+print(f"\n✅ Evaluation Results:")
+print(f"Accuracy: {accuracy:.2f}%")
+print(f"Average Loss: {avg_loss:.4f}")
