@@ -45,11 +45,11 @@ dataset_path = "/home/kpi_anna/data/test_grasp_dataset/set_1"
 query_set_directory = '/home/kpi_anna/data/test_grasp_dataset/query_set'
 query_json_path = "grasp_scripts/query_labels.json"
 
-dataset = ImageFolder(root=dataset_path, transform=transform)
-class_to_idx = dataset.class_to_idx
+support_dataset = ImageFolder(root=dataset_path, transform=transform)
+class_to_idx = support_dataset.class_to_idx
 num_classes = len(class_to_idx)
 
-def split_dataset(dataset):
+def load_support_set(dataset):
     support_set = []
     class_dict = {}
     for img, label in dataset:
@@ -69,16 +69,17 @@ def load_query_set_from_json(query_json_path, transform, class_to_idx):
             continue
         image = Image.open(image_path).convert("RGB")
         image_tensor = transform(image)
-        main_label = labels[0].replace(" ", "_")
-        if main_label not in class_to_idx:
-            print(f"⚠️ Label {main_label} not in support set mapping.")
-            continue
-        label_idx = class_to_idx[main_label]
-        query_set.append((filename, image_tensor, label_idx))
+        # main_label = labels[0].replace(" ", "_")
+        # if main_label not in class_to_idx:
+        #     print(f"⚠️ Label {main_label} not in support set mapping.")
+        #     continue
+        label_indexes = [class_to_idx[label.replace(' ', '_')] for label in labels]
+        # label_idx = class_to_idx[main_label]
+        query_set.append((filename, image_tensor, label_indexes))
     return query_set
 
 # Load support and query sets
-support_set = split_dataset(dataset)
+support_set = load_support_set(support_dataset)
 query_set = load_query_set_from_json(query_json_path, transform, class_to_idx)
 
 # Prepare support embeddings
@@ -90,30 +91,37 @@ support_embeddings = encode_images(support_images)
 
 # Initialize model
 matching_network = MatchingNetwork(num_classes=num_classes).to(device)
-
 # Accuracy counter
 correct = 0
 total = len(query_set)
 losses = []
 
 # Evaluation loop
-for filename, query_image, true_label in query_set:
+for filename, query_image, true_labels in query_set:
     query_image = query_image.unsqueeze(0).to(device)
     query_embedding = encode_images([query_image.squeeze(0)])
     predictions = matching_network(support_embeddings, support_labels, query_embedding)
     print(f"Prediction for {filename}:")
     print(predictions)
     predicted_class = torch.argmax(predictions).item()
-    if predicted_class == true_label:
+    if predicted_class in true_labels:
         correct += 1
-        print(f"Prediction for {filename} - {predicted_class} - correct")
+        print(f"Prediction for {filename} - {predicted_class} - correct - when correct are {true_labels}")
     else:
-        print(f"Prediction for {filename} - {predicted_class} - INCORRECT - when correct is {true_label}")
+        print(f"Prediction for {filename} - {predicted_class} - INCORRECT - when correct are {true_labels}")
 
-    # Cross-entropy loss
-    target = torch.tensor([true_label], dtype=torch.long).to(device)
-    loss = F.cross_entropy(predictions.unsqueeze(0), target)
+    # Convert list of true labels into multi-hot vector
+    target = torch.zeros(predictions.shape[-1], dtype=torch.float).to(device)
+    target[true_labels] = 1.0
+
+    # BCE loss expects raw logits, so don't apply softmax/sigmoid beforehand
+    loss = F.binary_cross_entropy_with_logits(predictions, target)
     losses.append(loss.item())
+
+    # Cross-entropy loss if there's only 1 true label
+    # target = torch.tensor([true_label], dtype=torch.long).to(device)
+    # loss = F.cross_entropy(predictions.unsqueeze(0), target)
+    # losses.append(loss.item())
 
 # Final results
 accuracy = correct / total * 100
