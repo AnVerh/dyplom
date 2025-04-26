@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from ultralytics import YOLO
 import torchvision.models.segmentation as segmentation
+import json, os
 
 # Prototypical NN + CLIP, with object detection and segmentation
 # Завантаження моделей
@@ -22,6 +23,13 @@ transform = transforms.Compose([
     transforms.Resize((224, 224)),  # Ensure compatibility with CLIP
     transforms.ToTensor()
 ])
+
+# Image encoding
+def encode_images(images):
+    inputs = clip_processor(images=images, return_tensors="pt", padding=True, do_rescale=False).to(device)
+    with torch.no_grad():
+        embeddings = clip_model.get_image_features(**inputs)
+    return embeddings / embeddings.norm(dim=-1, keepdim=True)
 
 # Convert tensor to PIL image
 def tensor_to_pil(image_tensor):
@@ -87,49 +95,82 @@ def extract_features_with_clip(model, processor, image_tensor):
 
 # Load Dataset and Apply Detection + Segmentation
 dataset_path = "/home/kpi_anna/data/test_grasp_dataset/set_1"
-dataset = ImageFolder(root=dataset_path, transform=transform)
+support_dataset = ImageFolder(root=dataset_path, transform=transform)
+query_set_directory = '/home/kpi_anna/data/test_grasp_dataset/query_set'
+query_json_path = "grasp_scripts/query_labels.json"
 
 # Print class mapping
-class_to_idx = dataset.class_to_idx
+class_to_idx = support_dataset.class_to_idx
 print("Class to Index Mapping:", class_to_idx)
 
-# Split dataset into support & query sets
-def split_dataset(dataset, num_shots=4):
-    support_set, query_set = [], []
+def load_support_set(dataset):
+    support_set = []
     class_dict = {}
-
     for img, label in dataset:
-        if label not in class_dict:
-            class_dict[label] = []
-        class_dict[label].append(img)
-
+        class_dict.setdefault(label, []).append(img)
     for label, images in class_dict.items():
-        support_set.extend([(img, label) for img in images[:num_shots]])
-        query_set.extend([(img, label) for img in images[num_shots:]])
-    
-    return support_set, query_set
+        support_set.extend([(img, label) for img in images])
+    return support_set
 
-support_set, query_set = split_dataset(dataset)
+def load_query_set_from_json(query_json_path, transform, class_to_idx):
+    with open(query_json_path, 'r') as f:
+        query_labels = json.load(f)
+    query_set = []
+    for filename, labels in query_labels.items():
+        image_path = os.path.join(query_set_directory, filename)
+        if not os.path.exists(image_path):
+            print(f"⚠️ Image {filename} not found, skipping.")
+            continue
+        image = Image.open(image_path).convert("RGB")
+        image_tensor = transform(image)
+        # main_label = labels[0].replace(" ", "_")
+        # if main_label not in class_to_idx:
+        #     print(f"⚠️ Label {main_label} not in support set mapping.")
+        #     continue
+        label_indexes = [class_to_idx[label.replace(' ', '_')] for label in labels]
+        # label_idx = class_to_idx[main_label]
+        query_set.append((filename, image_tensor, label_indexes))
+    return query_set
+
+support_set = load_support_set(support_dataset)
+query_set = load_query_set_from_json(query_json_path, transform, class_to_idx)
+
+# Prepare support embeddings
+support_images = torch.stack([img for img, _ in support_set]).to(device)
+support_labels = torch.tensor([label for _, label in support_set]).to(device)
+print("Support set labels:", support_labels)
+# print("Unique labels in support:", torch.unique(torch.tensor(support_labels)))
+support_embeddings = encode_images(support_images)
 
 # Extract Features for Support and Query Sets
-support_features = {
-    label: extract_features_with_clip(clip_model, clip_processor, img)
-    for img, label in support_set
-}
-query_features = [
-    (extract_features_with_clip(clip_model, clip_processor, img), label)
-    for img, label in query_set
-]
+# support_features = {
+#     label: extract_features_with_clip(clip_model, clip_processor, img)
+#     for img, label in support_set
+# }
+# query_features = [
+#     (extract_features_with_clip(clip_model, clip_processor, img), label)
+#     for img, label in query_set
+# ]
 
 # Compute Prototypes
-def compute_prototypes(support_features):
-    prototypes = {}
-    for label, features in support_features.items():
+from collections import defaultdict
+
+def compute_prototypes(support_set):
+    feature_dict = defaultdict(list)
+    for img, label in support_set:
+        features = extract_features_with_clip(clip_model, clip_processor, img)
         if features is not None:
-            prototypes[label] = features.mean(dim=0)  # Average feature vectors
+            feature_dict[label].append(features)
+
+    prototypes = {}
+    for label, feats in feature_dict.items():
+        stacked_feats = torch.stack(feats)
+        prototypes[label] = stacked_feats.mean(dim=0)
+
     return prototypes
 
-prototypes = compute_prototypes(support_features)
+
+prototypes = compute_prototypes(support_set)
 
 # Classification using Nearest Prototype
 def classify_image(query_feature, prototypes):
@@ -137,24 +178,19 @@ def classify_image(query_feature, prototypes):
     best_label = None
 
     for label, proto in prototypes.items():
-        if query_feature is None or proto is None:
-            if query_feature is None:
-                print("Query feature is None!")
-            if proto is None:
-                print("Prototype is None!")
-            continue
-        distance = F.pairwise_distance(query_feature.unsqueeze(0), proto.unsqueeze(0))
-        # cos_sim = F.cosine_similarity(query_feature, proto, dim=0)
-
+        distance = F.pairwise_distance(query_feature.unsqueeze(0).to(device), proto.unsqueeze(0).to(device))
         if distance < min_distance:
             min_distance = distance
-            best_label = label if label else "Unknown, try 0"
+            best_label = label
     
-    return best_label
+    return best_label  # Always return the closest class
+
 
 # Test on Query Set
 correct = 0
-for query_feature, label in query_features:
+total = len(query_set)
+
+'''for query_feature, label in query_features:
     predicted_label = classify_image(query_feature, prototypes)
     print(f"Predicted {predicted_label}, when correct is {label}")
     if predicted_label == label:
@@ -162,4 +198,18 @@ for query_feature, label in query_features:
 
 # Print Accuracy
 accuracy = correct / len(query_features)
-print(f"Accuracy: {accuracy * 100:.2f}%")
+print(f"Accuracy: {accuracy * 100:.2f}%")'''
+
+for filename, image_tensor, true_labels in query_set:
+    query_feature = extract_features_with_clip(clip_model, clip_processor, image_tensor)
+    predicted_label = classify_image(query_feature, prototypes) 
+    if predicted_label in true_labels:
+        correct += 1
+        print(f"Prediction for {filename} - {predicted_label} - correct - when correct are {true_labels}")
+    else:
+        print(f"Prediction for {filename} - {predicted_label} - INCORRECT - when correct are {true_labels}")
+
+accuracy = correct / total * 100
+
+print(f"\n✅ Evaluation Results:")
+print(f"Accuracy: {accuracy:.2f}%")
