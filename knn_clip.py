@@ -35,6 +35,10 @@ for grasp_type in grasp_types:
 
 # Convert the dictionary to numpy arrays for later use in KNN
 support_features = {grasp: np.array(features) for grasp, features in support_features.items()}
+# Reshape support features to fit into KNN
+support_labels = list(support_features.keys())
+support_vectors = np.array([support_features[label] for label in support_labels])
+support_vectors = support_vectors.squeeze(1)
 
 # Define multiple prompts for each grasp type
 prompts = {
@@ -86,11 +90,6 @@ def predict_image_grasp_type_with_knn(image_path):
     # Normalize
     query_vector = query_vector / np.linalg.norm(query_vector)
 
-    # Reshape support features to fit into KNN
-    support_labels = list(support_features.keys())
-    support_vectors = np.array([support_features[label] for label in support_labels])
-    support_vectors = support_vectors.squeeze(1)
-
     # Perform KNN to find nearest neighbors
     knn = NearestNeighbors(n_neighbors=7, metric="cosine")  # Use cosine similarity
     knn.fit(support_vectors)
@@ -102,15 +101,15 @@ def predict_image_grasp_type_with_knn(image_path):
         label = support_labels[idx]
         img_sim = cosine_similarity([query_vector], [support_vectors[idx]])[0][0]
         txt_sim = cosine_similarity([query_vector], [text_features[label]])[0][0]
-        combined = 0.25 * img_sim + 0.75 * txt_sim
+        combined = 0.4 * img_sim + 0.6 * txt_sim
         label_scores[label] += combined
 
-    print(f"label scores: \n {label_scores}")
-    # Predict class with highest accumulated score
-    predicted_label = max(label_scores, key=label_scores.get)
-    print(f"Predicted grasp type for {os.path.basename(image_path)}: {predicted_label}")
-    predicted_label = str(predicted_label).replace('_', ' ')
-    return predicted_label
+    # predicted_label = max(label_scores, key=label_scores.get)
+    # predicted_label = str(predicted_label).replace('_', ' ')
+    top_predicted_labels = sorted(label_scores.items(), key=lambda x:x[1], reverse=True)[:3]
+    top_predicted_labels = [str(label).replace('_', ' ') for label in top_predicted_labels]
+    # return predicted_label
+    return top_predicted_labels
 
 # Example query image
 # query_image_path = "/home/kpi_anna/data/test_grasp_dataset/query_set/image5.png"  # Modify with your query image path
@@ -120,41 +119,31 @@ num_correct_predictions = 0
 set_directory = '/home/kpi_anna/data/test_grasp_dataset/set_1'
 
 # Load ground truth labels (example as a dictionary)
-ground_truth = {
-    "image1.png": "cylindrical grasp",
-    "image2.png": "hook grasp",
-    "image3.png": "hook grasp",
-    "image4.png": "palmar grasp",
-    "image5.png": "palmar grasp",
-    "image6.png": "spherical grasp",
-    "image7.png": "pinch grasp",
-    "image8.png": "pinch grasp",
-    "image9.png": "tripod grasp",
-    "image10.png": "cylindrical grasp",
-    "image11.png": "open grasp",
-    #"image12.png": "adaptive grasp",
-    "image13.png": "lateral grasp",
-    "image14.png": "lateral grasp",
-    "image15.png": "cylindrical grasp",
-}
+import json
+
+with open("query_labels.json", "r") as f:
+    ground_truth = json.load(f)
 
 # Initialize counters
 num_correct_predictions = 0
 num_images = len(ground_truth)
 
 # Iterate through all images in the query set
-for image_name, true_label in ground_truth.items():
+for image_name, true_labels in ground_truth.items():
     image_path = os.path.join(query_set_directory, image_name)
     
-    predicted_label = predict_image_grasp_type_with_knn(image_path)
+    top_k_predictions = predict_image_grasp_type_with_knn(image_path)  # returns list of top 3 predictions
+    
+    # Check if any prediction is in the ground truth labels
+    match_found = any(pred in true_labels for pred, score in tuple(top_k_predictions))
 
-    if true_label in predicted_label:
+    if match_found:
         num_correct_predictions += 1
-        print(f"Predicted grasp for {image_name}:", predicted_label)
-    else: 
-        print(f"Predicted grasp {image_name}:", predicted_label, " - INCORRECT!")
-
-
+        print(f"[✔] {image_name} - Prediction(s): {top_k_predictions} | GT: {true_labels}")
+    else:
+        print(f"[✘] {image_name} - Prediction(s): {top_k_predictions} | GT: {true_labels}")
+        
 # Calculate accuracy
 accuracy = (num_correct_predictions / num_images) * 100
 print(f"Accuracy: {accuracy:.2f}%")
+# print(f"Predicted Grasp: {predicted_label}")
