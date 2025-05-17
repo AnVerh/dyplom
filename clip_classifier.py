@@ -13,20 +13,28 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --------- Projection Head ---------
 class ProjectionHead(nn.Module):
-    def __init__(self, in_dim=512, out_dim=512):
+    def __init__(self, in_dim=512, mid_dim=512, out_dim=512):
         super().__init__()
+        # self.fc = nn.Linear(in_dim, out_dim)
+        dropout_prob=0.1
         self.fc = nn.Sequential(
-            nn.Linear(in_dim, out_dim),
+            nn.Linear(in_dim, mid_dim),
             nn.ReLU(),
-            nn.Linear(out_dim, out_dim)
+            nn.Dropout(dropout_prob),
+            nn.Linear(mid_dim, out_dim)
         )
+        # self.fc = nn.Sequential(
+        #     nn.Linear(in_dim, out_dim),
+        #     nn.ReLU(),
+        #     nn.Linear(out_dim, out_dim)
+        # )
 
     def forward(self, x):
         return self.fc(x)
 
 # --------- Custom CLIP with Projection Head ---------
 class CLIPWithProjectionHead(nn.Module):
-    def __init__(self, base_model_name="openai/clip-vit-base-patch32", freeze_base=False, device='cuda'):
+    def __init__(self, base_model_name="openai/clip-vit-base-patch32", freeze_base=True, device='cuda'):
         super().__init__()
         self.clip = CLIPModel.from_pretrained(base_model_name)
         self.image_proj = ProjectionHead(in_dim=512, out_dim=512)
@@ -36,7 +44,7 @@ class CLIPWithProjectionHead(nn.Module):
         if freeze_base:
             for param in self.clip.parameters():
                 param.requires_grad = False
-            for param in self.clip.vision_model.encoder.layers[-2:].parameters():
+            for param in self.clip.vision_model.encoder.layers[-6:].parameters():
                 param.requires_grad = True 
 
         # Learnable logit scale (temperature)
@@ -61,6 +69,45 @@ class CLIPWithProjectionHead(nn.Module):
         # text_proj = F.normalize(text_proj, dim=-1)
 
         return image_proj, text_proj
+    
+    def get_image_features(self, images=None, pixel_values=None):
+        """
+        Extract image features and apply projection head.
+        Accepts either raw images or preprocessed pixel_values.
+        """
+        if images is not None:
+            inputs = self.processor(images=images, return_tensors="pt")
+            pixel_values = inputs["pixel_values"]
+
+        elif pixel_values is None:
+            raise ValueError("Must provide either `images` or `pixel_values`")
+
+        # Ensure the tensor is on the same device as the model
+        device = next(self.clip.parameters()).device
+        pixel_values = pixel_values.to(device)
+
+        outputs = self.clip.vision_model(pixel_values=pixel_values)
+        image_embeds = self.clip.visual_projection(outputs.pooler_output)
+        return self.image_proj(image_embeds)
+
+
+    def get_text_features(self, text=None, input_ids=None, attention_mask=None):
+        """
+        Extract text features and apply projection head.
+        Accepts either raw text or tokenized input_ids + attention_mask.
+        """
+        if text is not None:
+            inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True)
+            input_ids = inputs["input_ids"]
+            attention_mask = inputs["attention_mask"]
+
+        if input_ids is None or attention_mask is None:
+            raise ValueError("Must provide either `text` or (`input_ids`, `attention_mask`)")
+
+        outputs = self.clip.text_model(input_ids=input_ids, attention_mask=attention_mask)
+        text_embeds = self.clip.text_projection(outputs.pooler_output)
+        return self.text_proj(text_embeds)
+
 
 def main():
     # --------- Load model and processor ---------
@@ -129,14 +176,19 @@ def main():
                 support_texts.append(prompt)
 
     # --------- Training ---------
-    epochs = 10
+    epochs = 20
+    patience = 10
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    best_model_state = None
     batch_size = 16
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
     scheduler = StepLR(optimizer, step_size=30, gamma=0.5)
     loss_fn = nn.CrossEntropyLoss()
 
+    model.train()
     for epoch in range(epochs):
-        model.train()
+        
         total_loss = 0
 
         for i in range(0, len(support_images), batch_size):
@@ -159,7 +211,8 @@ def main():
         print(f"Epoch {epoch+1}/{epochs} - Loss: {total_loss:.4f}")
 
     # --------- Evaluation ---------
-    model.eval()
+    with torch.no_grad():
+        model.eval()
 
     with open(query_labels_path, "r") as f:
         ground_truth = json.load(f)
@@ -180,24 +233,26 @@ def main():
     top_k = 3
     total = len(query_images)
 
-    with torch.no_grad():
-        for idx, image in enumerate(query_images):
-            _, text_proj = model(image=None, text=class_prompts, processor=processor)
-            image_proj, _ = model(image=[image], text=[class_prompts[0]], processor=processor)
+    _, text_proj = model(image=None, text=class_prompts, processor=processor)
 
-            image_proj = image_proj[0]
-            logits = (image_proj @ text_proj.T).squeeze()
-            top_indices = torch.topk(logits, k=top_k).indices.cpu().numpy()
-            predicted_classes = [unique_labels[i] for i in top_indices]
+    for idx, image in enumerate(query_images):
+        
+        # image_proj, _ = model(image=[image], text=[class_prompts[0]], processor=processor)
+        image_proj, _ = model(image=[image], processor=processor)
+        image_proj = image_proj[0]
 
-            true_labels = ground_truth[query_filenames[idx]]
+        logits = (image_proj @ text_proj.T).squeeze()
+        top_indices = torch.topk(logits, k=top_k).indices.cpu().numpy()
+        predicted_classes = [unique_labels[i] for i in top_indices]
 
-            print(f"Prediction: {predicted_classes}, Ground Truth: {true_labels}")
-            if any(pred.replace('_', ' ') in true_labels for pred in predicted_classes):
-                print("✓ Correct")
-                correct += 1
-            else:
-                print("✗ Incorrect")
+        true_labels = ground_truth[query_filenames[idx]]
+
+        print(f"Prediction: {predicted_classes}, Ground Truth: {true_labels}")
+        if any(pred.replace('_', ' ') in true_labels for pred in predicted_classes):
+            print("✓ Correct")
+            correct += 1
+        else:
+            print("✗ Incorrect")
 
     accuracy = correct / total * 100
     print(f"\nTop-{top_k} Accuracy with Projection Head: {accuracy:.2f}%")
