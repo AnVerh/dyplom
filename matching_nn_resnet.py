@@ -5,9 +5,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
-from torch.utils.data import Dataset, DataLoader
 import os
 from torchvision.datasets import ImageFolder
+from matching_networks_clip import save_loss_plot
 
 # ---------- Matching Network ----------
 class MatchingNetwork(nn.Module):
@@ -60,12 +60,7 @@ def load_query_set_from_json(query_json_path, transform, class_to_idx):
             continue
         image = Image.open(image_path).convert("RGB")
         image_tensor = transform(image)
-        # main_label = labels[0].replace(" ", "_")
-        # if main_label not in class_to_idx:
-        #     print(f"⚠️ Label {main_label} not in support set mapping.")
-        #     continue
         label_indexes = [class_to_idx[label.replace(' ', '_')] for label in labels]
-        # label_idx = class_to_idx[main_label]
         query_set.append((filename, image_tensor, label_indexes))
     return query_set
 
@@ -93,11 +88,9 @@ def load_support_set(dataset):
 support_set = load_support_set(support_dataset)
 support_images = torch.stack([img for img, _ in support_set]).to(device)
 support_labels = torch.tensor([label for _, label in support_set]).to(device)
-print("Support set labels:", support_labels)
-print("Unique labels in support:", torch.unique(torch.tensor(support_labels)))
+# print("Support set labels:", support_labels)
+# print("Unique labels in support:", torch.unique(torch.tensor(support_labels)))
 # support_embeddings = encode_images(support_images)
-# ---------- Load Query Set ----------
-query_set = load_query_set_from_json(query_json_path, transform, class_to_idx)
 
 
 # ---------- Device ----------
@@ -118,40 +111,63 @@ with torch.no_grad():
     support_features = feature_extractor(support_images)
     support_features = F.normalize(support_features, dim=-1)
 
-# ---------- Evaluation ----------
-# Accuracy counter
-correct = 0
-total = len(query_set)
-losses = []
+def get_image_predictions_mnn_resnet(image_path, top_k=3):
+    image = Image.open(image_path).convert("RGB")
+    image_tensor = transform(image).unsqueeze(0).to(device)
+    image_feature = feature_extractor(image_tensor)
+    image_feature = F.normalize(image_feature, dim=-1)
+    predictions = matching_network(support_features, support_labels, image_feature)
+    topk_indices = torch.topk(predictions, k=top_k).indices.cpu().tolist()
+    topk_predictions = []
+    for idx in topk_indices:
+        topk_predictions.append(list(class_to_idx.keys())[list(class_to_idx.values()).index(idx)])
+    return topk_predictions
 
-# Evaluation loop
-for filename, query_image, true_labels in query_set:
-    query_image = query_image.unsqueeze(0).to(device)
-    query_feature = feature_extractor(query_image)
-    query_feature = F.normalize(query_feature, dim=-1)
-    predictions = matching_network(support_features, support_labels, query_feature)
-    print(f"Prediction for {filename}:")
-    print(predictions)
-    predicted_class = torch.argmax(predictions).item()
-    if predicted_class in true_labels:
-        correct += 1
-        print(f"Prediction for {filename} - {predicted_class} - correct - when correct are {true_labels}")
-    else:
-        print(f"Prediction for {filename} - {predicted_class} - INCORRECT - when correct are {true_labels}")
+def evaluate():
+    # ---------- Evaluation ----------
+    # Accuracy counter
+    query_set = load_query_set_from_json(query_json_path, transform, class_to_idx)
+    correct = 0
+    total = len(query_set)
+    losses = []
+    top_k=1
+    # Evaluation loop
+    for filename, query_image, true_labels in query_set:
+        query_image = query_image.unsqueeze(0).to(device)
+        query_feature = feature_extractor(query_image)
+        query_feature = F.normalize(query_feature, dim=-1)
+        predictions = matching_network(support_features, support_labels, query_feature)
+        print(f"Prediction for {filename}:")
 
-    # Convert list of true labels into multi-hot vector
-    target = torch.zeros(predictions.shape[-1], dtype=torch.float).to(device)
-    target[true_labels] = 1.0
+        top3_indices = torch.topk(predictions, k=top_k).indices.cpu().tolist()
+        match_found = any(pred in true_labels for pred in top3_indices)
+        
+        if match_found:
+            correct += 1
+            print(f"Prediction for {filename} - {top3_indices} - correct - when correct are {true_labels}")
+        else:
+            print(f"Prediction for {filename} - {top3_indices} - INCORRECT - when correct are {true_labels}")
 
-    # BCE loss expects raw logits, so don't apply softmax/sigmoid beforehand
-    loss = F.binary_cross_entropy_with_logits(predictions, target)
-    losses.append(loss.item())
+        # Convert list of true labels into multi-hot vector
+        target = torch.zeros(predictions.shape[-1], dtype=torch.float).to(device)
+        target[true_labels] = 1.0
+
+        # BCE loss expects raw logits, so don't apply softmax/sigmoid beforehand
+        loss = F.binary_cross_entropy_with_logits(predictions, target)
+        losses.append(loss.item())
 
 
-# Final results
-accuracy = correct / total * 100
-avg_loss = sum(losses) / len(losses)
+    # Final results
+    accuracy = correct / total * 100
+    avg_loss = sum(losses) / len(losses)
+    save_loss_plot(losses, "Matching NN with ResNet")
 
-print(f"\n✅ Evaluation Results:")
-print(f"Accuracy: {accuracy:.2f}%")
-print(f"Average Loss: {avg_loss:.4f}")
+    print(f"\n✅ Evaluation Results:")
+    print(f"Accuracy: {accuracy:.2f}%")
+    print(f"Average Loss: {avg_loss:.4f}")
+
+if __name__ == "__main__":
+    evaluate()
+    # print(class_to_idx)
+    # preds = get_image_predictions_mnn_resnet("/home/kpi_anna/data/test_grasp_dataset/query_set/image2.png")
+    # print(preds)

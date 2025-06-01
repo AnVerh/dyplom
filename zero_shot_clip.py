@@ -2,6 +2,7 @@ import torch
 from transformers import CLIPProcessor, CLIPModel
 from PIL import Image
 import os, os.path
+import json
 
 # Load CLIP model and processor
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -17,7 +18,6 @@ grasp_prompts = [
     "An object that requires a **tripod grasp**, because it is held between the thumb, index, and middle fingers, like a pen, a piece of chalk, or a small screwdriver.",
     "An object that requires a **pinch grasp**, because it is small and held between the thumb and index finger, like a coin, a needle, or a small button.",
     "An object that requires an **open grasp**, because it is large and flat, requiring a wide grip, like a box, a book, or a tablet.",
-    "An object that requires an **adaptive grasp**, because it has an uneven shape, requiring fingers to adjust dynamically, like a stuffed toy, a rock, or a crumpled piece of paper.",
     "An object that requires a **lateral grasp**, because it is held between the thumb and the side of the index finger, like a key, a credit card, or a thin piece of paper."
 ]
 
@@ -30,7 +30,7 @@ text_inputs = processor(
     truncation=True  # Truncate prompts if they exceed the max length
 ).to(device)
 
-def predict_image_grasp_type(image_path):
+def predict_image_grasp_type(image_path, top_k=3):
     # Preprocess query image
     # image_path = '/home/kpi_anna/data/test_grasp_dataset/query_set/image1.png'
     image = Image.open(image_path).convert("RGB")
@@ -47,46 +47,56 @@ def predict_image_grasp_type(image_path):
     similarity = torch.matmul(image_features, text_features.T)
 
     # Predict the grasp type
-    predicted_index = similarity.argmax().item()
-    predicted_prompt = grasp_prompts[predicted_index]
-    print(f"Predicted grasp type for {os.path.basename(image_path)}: {predicted_prompt}")
-    return predicted_prompt
+    # predicted_index = similarity.argmax().item()
+    top3_indices = similarity.topk(top_k).indices.tolist()[0]
+    # predicted_prompt = grasp_prompts[predicted_index]
+    top3_prompts = [grasp_prompts[i] for i in top3_indices]
+    # print(f"Predicted grasp type for {os.path.basename(image_path)}: {predicted_prompt}")
+    return top3_prompts
 
-# model evaluation
-query_set_directory = '/home/kpi_anna/data/test_grasp_dataset/query_set'
-num_images = len([name for name in os.listdir(query_set_directory) if os.path.isfile(name)])
-num_correct_predictions = 0
-set_directory = '/home/kpi_anna/data/test_grasp_dataset/set_1'
+def evaluate():
+    # model evaluation
+    query_set_directory = '/home/kpi_anna/data/test_grasp_dataset/query_set'
+    num_images = len([name for name in os.listdir(query_set_directory) if os.path.isfile(name)])
+    num_correct_predictions = 0
+    set_directory = '/home/kpi_anna/data/test_grasp_dataset/set_1'
 
-# Load ground truth labels (example as a dictionary)
-ground_truth = {
-    "image.png": "cylindrical grasp",
-    "image1.png": "cylindrical grasp",
-    "image2.png": "hook grasp",
-    "image3.png": "hook grasp",
-    "image4.png": "palmar grasp",
-    "image5.png": "palmar grasp",
-    "image6.png": "spherical grasp",
-    "image7.png": "pinch grasp",
-    "image8.png": "pinch grasp",
-    "image9.png": "tripod grasp",
-    "image10.png": "cylindrical grasp",
-    "image11.png": "open grasp",
-    "image12.png": "adaptive grasp",
-}
+    # Load ground truth labels (example as a dictionary)
+    with open("grasp_scripts/query_labels.json", "r") as f:
+        ground_truth = json.load(f)
 
-# Initialize counters
-num_correct_predictions = 0
-num_images = len(ground_truth)
+    # Initialize counters
+    num_correct_predictions = 0
+    num_images = len(ground_truth)
 
-# Iterate through all images in the query set
-for image_name, true_label in ground_truth.items():
-    image_path = os.path.join(query_set_directory, image_name)
-    predicted_label = predict_image_grasp_type(image_path)
-     # Compare prediction with ground truth
-    if true_label in predicted_label:
-        num_correct_predictions += 1
+    # Iterate through all images in the query set
+    for image_name, true_labels in ground_truth.items():
+        image_path = os.path.join(query_set_directory, image_name)
+        predicted_prompts = predict_image_grasp_type(image_path, top_k=1)
+        pred_was_true = False
+        # Compare prediction with ground truth
+        # if true_label in predicted_label:
+        for pred_prompt in predicted_prompts:
+            for label in true_labels:
+                if label in pred_prompt:
+                    num_correct_predictions += 1
+                    pred_was_true = True
+                    print(f"[✔] {image_name} | Predicted: {predicted_prompts} | GT: {true_labels}")
+                    break
+            if pred_was_true: break
+        if not pred_was_true:
+            print(f"[✘] {image_name} | Predicted: {predicted_prompts} | GT: {true_labels}")
+            
+        # if any(label in predicted_labels for label in true_labels):
+        #     num_correct_predictions += 1
+        #     print(f"[✔] {image_name} | Predicted: {predicted_labels} | GT: {true_labels}")
+        # else:
+        #     print(f"[✘] {image_name} | Predicted: {predicted_labels} | GT: {true_labels}")
 
-# Calculate accuracy
-accuracy = (num_correct_predictions / num_images) * 100
-print(f"Accuracy: {accuracy:.2f}%")
+    # Calculate accuracy
+    accuracy = (num_correct_predictions / num_images) * 100
+    print(f"Accuracy: {accuracy:.2f}%")
+
+if __name__ == "__main__":
+    evaluate()
+    

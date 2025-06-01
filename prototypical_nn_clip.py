@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from ultralytics import YOLO
 import torchvision.models.segmentation as segmentation
 import json, os
+from matching_networks_clip import save_loss_plot
 
 # Prototypical NN + CLIP, with object detection and segmentation
 # Завантаження моделей
@@ -33,7 +34,7 @@ def encode_images(images):
 
 # Convert tensor to PIL image
 def tensor_to_pil(image_tensor):
-    image_np = image_tensor.numpy().transpose(1, 2, 0)
+    image_np = image_tensor.squeeze(0).cpu().numpy().transpose(1, 2, 0)
     image_np = np.clip(image_np * 255, 0, 255).astype(np.uint8)
     return Image.fromarray(image_np)
 
@@ -101,7 +102,7 @@ query_json_path = "grasp_scripts/query_labels.json"
 
 # Print class mapping
 class_to_idx = support_dataset.class_to_idx
-print("Class to Index Mapping:", class_to_idx)
+# print("Class to Index Mapping:", class_to_idx)
 
 def load_support_set(dataset):
     support_set = []
@@ -123,12 +124,7 @@ def load_query_set_from_json(query_json_path, transform, class_to_idx):
             continue
         image = Image.open(image_path).convert("RGB")
         image_tensor = transform(image)
-        # main_label = labels[0].replace(" ", "_")
-        # if main_label not in class_to_idx:
-        #     print(f"⚠️ Label {main_label} not in support set mapping.")
-        #     continue
         label_indexes = [class_to_idx[label.replace(' ', '_')] for label in labels]
-        # label_idx = class_to_idx[main_label]
         query_set.append((filename, image_tensor, label_indexes))
     return query_set
 
@@ -138,19 +134,9 @@ query_set = load_query_set_from_json(query_json_path, transform, class_to_idx)
 # Prepare support embeddings
 support_images = torch.stack([img for img, _ in support_set]).to(device)
 support_labels = torch.tensor([label for _, label in support_set]).to(device)
-print("Support set labels:", support_labels)
+# print("Support set labels:", support_labels)
 # print("Unique labels in support:", torch.unique(torch.tensor(support_labels)))
 support_embeddings = encode_images(support_images)
-
-# Extract Features for Support and Query Sets
-# support_features = {
-#     label: extract_features_with_clip(clip_model, clip_processor, img)
-#     for img, label in support_set
-# }
-# query_features = [
-#     (extract_features_with_clip(clip_model, clip_processor, img), label)
-#     for img, label in query_set
-# ]
 
 # Compute Prototypes
 from collections import defaultdict
@@ -185,31 +171,70 @@ def classify_image(query_feature, prototypes):
     
     return best_label  # Always return the closest class
 
+def classify_image(query_feature, prototypes):
+    distances = []
+    for label, proto in prototypes.items():
+        distance = F.pairwise_distance(query_feature.unsqueeze(0), proto.unsqueeze(0))
+        distances.append((label, distance.item()))  # Convert distance to float
+    # Sort by distance (ascending)
+    distances.sort(key=lambda x: x[1])
+    # Return top 3 labels
+    top_3_labels = [label for label, dist in distances]
 
-# Test on Query Set
-correct = 0
-total = len(query_set)
+    return top_3_labels
 
-'''for query_feature, label in query_features:
-    predicted_label = classify_image(query_feature, prototypes)
-    print(f"Predicted {predicted_label}, when correct is {label}")
-    if predicted_label == label:
-        correct += 1
+def get_image_predictions_pnn_clip(image_path, top_k=3):
+    image = Image.open(image_path).convert("RGB")
+    image_tensor = transform(image)
+    image_feature = extract_features_with_clip(clip_model, clip_processor, image_tensor)
+    image_feature = F.normalize(image_feature, dim=-1)
+    predictions = classify_image(image_feature, prototypes)[:top_k]
+    return predictions
 
-# Print Accuracy
-accuracy = correct / len(query_features)
-print(f"Accuracy: {accuracy * 100:.2f}%")'''
+def evaluate():
+    # Test on Query Set
+    top_k=1
+    correct = 0
+    total = len(query_set)
+    losses = []
+    for filename, image_tensor, true_labels in query_set:
+        query_feature = extract_features_with_clip(clip_model, clip_processor, image_tensor)
+        top3_indices = classify_image(query_feature, prototypes)[:top_k]
+        match_found = any(pred in true_labels for pred in top3_indices)
+        
+        if match_found:
+            correct += 1
+            print(f"Prediction for {filename} - {top3_indices} - correct - when correct are {true_labels}")
+        else:
+            print(f"Prediction for {filename} - {top3_indices} - INCORRECT - when correct are {true_labels}")
 
-for filename, image_tensor, true_labels in query_set:
-    query_feature = extract_features_with_clip(clip_model, clip_processor, image_tensor)
-    predicted_label = classify_image(query_feature, prototypes) 
-    if predicted_label in true_labels:
-        correct += 1
-        print(f"Prediction for {filename} - {predicted_label} - correct - when correct are {true_labels}")
-    else:
-        print(f"Prediction for {filename} - {predicted_label} - INCORRECT - when correct are {true_labels}")
+        all_labels = list(prototypes.keys())
+        distances = []
+        for label in all_labels:
+            proto = prototypes[label]
+            distance = F.pairwise_distance(query_feature.unsqueeze(0), proto.unsqueeze(0))
+            distances.append(distance.item())
+        # Convert distances to similarity logits (negative distance = higher similarity)
+        logits = torch.tensor([-d for d in distances]).unsqueeze(0)
 
-accuracy = correct / total * 100
+        # Create multi-hot ground truth vector
+        target = torch.zeros(len(all_labels)).unsqueeze(0)
+        for label in true_labels:
+            target[0][label] = 1.0
 
-print(f"\n✅ Evaluation Results:")
-print(f"Accuracy: {accuracy:.2f}%")
+        loss = F.binary_cross_entropy_with_logits(logits, target)
+        losses.append(loss.item())
+
+    accuracy = correct / total * 100
+    avg_loss = sum(losses) / len(losses)
+    save_loss_plot(losses, "Prototypical NN with CLIP")
+
+    print(f"\n✅ Evaluation Results:")
+    print(f"Accuracy: {accuracy:.2f}%")
+    print(f"Average Loss: {avg_loss:.4f}")
+
+if __name__ == "__main__":
+    evaluate()
+    # print(class_to_idx)
+    # preds = get_image_predictions_pnn_clip("/home/kpi_anna/data/test_grasp_dataset/query_set/image2.png")
+    # print(preds)

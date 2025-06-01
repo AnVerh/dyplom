@@ -38,8 +38,10 @@ def classify_grasp(image, method):
     if method=="Gemma":
         # grasp_type_image_path = ""
         if 'grasp' in prediction.lower():
-            grasp_type_image_path = f"/home/kpi_anna/data/test_grasp_dataset/grasp_types/{prediction.lower().replace(' ', '_')}.jpg"
-            return prediction, [grasp_type_image_path] #Image.open(grasp_type_image_path)
+            pred_key = prediction.lower().replace(" ", "_")
+            ukr_name = GRASP_TRANSLATIONS.get(pred_key, prediction)
+            grasp_type_image_path = f"/home/kpi_anna/data/test_grasp_dataset/grasp_types/{pred_key}.jpg"
+            return ukr_name, [grasp_type_image_path] #Image.open(grasp_type_image_path)
         else:
             prediction += '\nНе було отримано захвату, але можна спробувати:'
             grasp_type_image_path = "/home/kpi_anna/data/test_grasp_dataset/grasp_types/cylindrical_grasp.jpg"
@@ -49,8 +51,9 @@ def classify_grasp(image, method):
         display_names = []
 
         for pred in top_predictions:
-            display_names.append(pred)
             pred_key = pred.lower().replace(" ", "_")
+            ukr_name = GRASP_TRANSLATIONS.get(pred_key, pred) 
+            display_names.append(ukr_name)
             grasp_img_path = f"/home/kpi_anna/data/test_grasp_dataset/grasp_types/{pred_key}.jpg"
             try:
                 img = Image.open(grasp_img_path)
@@ -61,17 +64,34 @@ def classify_grasp(image, method):
         return ", ".join(display_names), image_paths
 
 
-classification_methods = ["matching network with CLIP", "matching network with ResNet",
-                          "prototypical network with CLIP", "prototypical network with ResNet",
-                          "zero-shot CLIP", "Gemma", "KNN with CLIP", "KNN with fine-tuned CLIP"]
+classification_methods = ["matching network та CLIP", "matching network та ResNet",
+                          "prototypical network та CLIP", "prototypical network та ResNet",
+                          "zero-shot CLIP", "Gemma", "KNN та CLIP", "KNN та fine-tuned CLIP"]
+
+GRASP_TRANSLATIONS = {
+    "hook_grasp": "гачковий захват",
+    "lateral_grasp": "латеральний захват",
+    "open_grasp": "відкритий захват",
+    "cylindrical_grasp": "циліндричний захват",
+    "tripod_grasp": "трьохпальцевий захват",
+    "pinch_grasp": "щипковий захват",
+    "palmar_grasp": "долонний захват",
+    "spherical_grasp": "сферичний захват"
+}
+
 
 with gr.Blocks() as demo:
-    img_input = gr.Image(type="pil", label="Зображення")
-    method = gr.Dropdown(classification_methods, label="Метод")
-    predict_btn = gr.Button("Дізнатися захват")
-    
-    output_text = gr.Textbox(label="Передбачений захват:")
-    gallery = gr.Gallery(label="Вигляд захвату:", height=300)  # No fixed columns/rows
+    gr.Markdown("## Визначення типу захвату")
+
+    with gr.Row():
+        with gr.Column(scale=1):  # Ліва колонка
+            img_input = gr.Image(type="pil", label="Зображення")
+            method = gr.Dropdown(classification_methods, label="Метод")
+            predict_btn = gr.Button("Дізнатися захват")
+
+        with gr.Column(scale=1):  # Права колонка
+            output_text = gr.Textbox(label="Передбачений захват:")
+            gallery = gr.Gallery(label="Вигляд захвату:", height=500)
 
     def wrapped_classify(image, method):
         text, imgs = classify_grasp(image, method)
@@ -80,4 +100,5 @@ with gr.Blocks() as demo:
     predict_btn.click(fn=wrapped_classify, inputs=[img_input, method], outputs=[output_text, gallery])
 
 demo.launch()
+
 

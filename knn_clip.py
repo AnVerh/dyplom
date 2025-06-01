@@ -6,6 +6,7 @@ import numpy as np
 from sklearn.neighbors import NearestNeighbors
 from sklearn.metrics.pairwise import cosine_similarity
 from collections import defaultdict
+from collections import Counter
 
 
 # Initialize CLIP model and processor
@@ -79,7 +80,7 @@ def encode_text_prompts(prompts, clip_model, device):
 # Get text features for each grasp class
 text_features = encode_text_prompts(prompts, clip_model, device)
 
-def predict_image_grasp_type_with_knn(image_path):
+def predict_image_grasp_type_with_knn(image_path, top_k=3):
     query_image = Image.open(image_path)
     query_image_input = clip_processor(images=query_image, return_tensors='pt').to(device)
 
@@ -101,49 +102,73 @@ def predict_image_grasp_type_with_knn(image_path):
         label = support_labels[idx]
         img_sim = cosine_similarity([query_vector], [support_vectors[idx]])[0][0]
         txt_sim = cosine_similarity([query_vector], [text_features[label]])[0][0]
-        combined = 0.4 * img_sim + 0.6 * txt_sim
+        combined = 0.5 * img_sim + 0.5 * txt_sim
         label_scores[label] += combined
 
-    # predicted_label = max(label_scores, key=label_scores.get)
-    # predicted_label = str(predicted_label).replace('_', ' ')
-    top_predicted_labels = sorted(label_scores.items(), key=lambda x:x[1], reverse=True)[:3]
+    top_predicted_labels = sorted(label_scores.items(), key=lambda x:x[1], reverse=True)[:top_k]
     top_predicted_labels = [str(label).replace('_', ' ') for label in top_predicted_labels]
-    # return predicted_label
-    return top_predicted_labels
+    parsed_predictions = [eval(str(pred)) for pred in top_predicted_labels]
+    # Extract just the classes
+    predicted_classes = [pred for (pred, score) in parsed_predictions]
+    return predicted_classes
 
-# Example query image
-# query_image_path = "/home/kpi_anna/data/test_grasp_dataset/query_set/image5.png"  # Modify with your query image path
-query_set_directory = '/home/kpi_anna/data/test_grasp_dataset/query_set'
-num_images = len([name for name in os.listdir(query_set_directory) if os.path.isfile(name)])
-num_correct_predictions = 0
-set_directory = '/home/kpi_anna/data/test_grasp_dataset/set_1'
+def evaluate():
+    # Example query image
+    # query_image_path = "/home/kpi_anna/data/test_grasp_dataset/query_set/image5.png"  # Modify with your query image path
+    query_set_directory = '/home/kpi_anna/data/test_grasp_dataset/query_set'
+    query_labels_path = "/home/kpi_anna/grasp_scripts/query_labels.json"
+    # Load ground truth labels (example as a dictionary)
+    import json
 
-# Load ground truth labels (example as a dictionary)
-import json
+    with open(query_labels_path, "r") as f:
+        ground_truth = json.load(f)
 
-with open("query_labels.json", "r") as f:
-    ground_truth = json.load(f)
-
-# Initialize counters
-num_correct_predictions = 0
-num_images = len(ground_truth)
-
-# Iterate through all images in the query set
-for image_name, true_labels in ground_truth.items():
-    image_path = os.path.join(query_set_directory, image_name)
-    
-    top_k_predictions = predict_image_grasp_type_with_knn(image_path)  # returns list of top 3 predictions
-    
-    # Check if any prediction is in the ground truth labels
-    match_found = any(pred in true_labels for pred, score in tuple(top_k_predictions))
-
-    if match_found:
-        num_correct_predictions += 1
-        print(f"[✔] {image_name} - Prediction(s): {top_k_predictions} | GT: {true_labels}")
-    else:
-        print(f"[✘] {image_name} - Prediction(s): {top_k_predictions} | GT: {true_labels}")
+    # Initialize counters
+    class_total = 0
+    correct=0
+    num_images = len(ground_truth)
+    class_correct = Counter()
+    class_total = Counter()
+    # Iterate through all images in the query set
+    for image_name, true_labels in ground_truth.items():
+        image_path = os.path.join(query_set_directory, image_name)
         
-# Calculate accuracy
-accuracy = (num_correct_predictions / num_images) * 100
-print(f"Accuracy: {accuracy:.2f}%")
-# print(f"Predicted Grasp: {predicted_label}")
+        top_k_predictions = predict_image_grasp_type_with_knn(image_path, top_k=1)  # returns list of top 3 predictions
+        print(f'Top k predictions are: {top_k_predictions}')
+        # parsed_predictions = [eval(str(pred)) for pred in top_k_predictions]
+        # Extract just the classes
+        # predicted_classes = [pred.replace('_', ' ') for (pred, score) in parsed_predictions]
+        predicted_classes = [pred.replace('_', ' ') for pred in top_k_predictions]
+
+        # Count total instances for each ground truth class
+        for grasp_type in true_labels:
+            class_total[grasp_type] += 1  # Tracks how many times this grasp type appears in ground truth
+
+        # Check which predictions match the ground truth
+        if any(pred in true_labels for pred in predicted_classes):
+            correct += 1
+            for pred in predicted_classes:
+                if pred in true_labels:  # If prediction is correct for any grasp type
+                    class_correct[pred] += 1  # Increment correct count for that grasp type
+
+            print(f"[✔] {image_name} | Predicted: {predicted_classes} | GT: {true_labels}")
+        else:
+            print(f"[✘] {image_name} | Predicted: {predicted_classes} | GT: {true_labels}")
+
+    # Compute per-class accuracy
+    class_accuracy = {cls: class_correct[cls] / class_total[cls] if class_total[cls] > 0 else 0 for cls in class_total}
+    
+    # Print class-wise accuracy
+    print("\nClass-Wise Accuracy:")
+    for grasp_type, acc in class_accuracy.items():
+        print(f"{grasp_type}: {acc*100:.2f}%")
+
+    # Final Accuracy
+    overall_accuracy = 100 * correct / len(ground_truth)
+    print(f"\nFinal Accuracy: {overall_accuracy:.2f}%")
+
+if __name__ == "__main__":
+    evaluate()
+    # im_path = '/home/kpi_anna/data/image3.png'
+    # preds = predict_image_grasp_type_with_knn(im_path)
+    # print(preds)
